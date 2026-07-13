@@ -1,3 +1,11 @@
+> ### 🔱 This is a fork.
+>
+> The task, the dataset, the baselines and everything below this box are the work of the **[SemEval 2025 Task 9 organizers](#task-organizers)**, preserved unchanged. I have added one thing: my own solution to the challenge, in [`solution/`](solution/).
+>
+> **→ [Jump to my solution](#my-solution)** — four fine-tuned RoBERTa-large classifiers, scoring **0.7895** on Sub-Task 1 under the organizers' own metric.
+
+---
+
 # SemEval 2025 Task 9: The Food Hazard Detection Challenge
 
 The Food Hazard Detection task evaluates explainable classification systems for titles of food-incident reports collected from the web. These algorithms may help automated crawlers find and extract food issues from web sources like social media in the future. Due to the potential high economic impact, transparency is crucial for this task.
@@ -113,3 +121,92 @@ All texts come from official and publicly available sources, so no privacy issue
       <td style="width:195px"><img src="https://efraproject.eu/wp-content/uploads/2023/01/EN-Funded-by-the-EU-NEG-1024x215.png" alt="EU Flag" width="457"/></td>
    </tr>
 </table>
+
+---
+---
+
+# My Solution
+
+*Everything above this line is the organizers' work. Everything below is mine.*
+
+Four fine-tuned **RoBERTa-large** classifiers, one per label, with the class imbalance handled per label rather than globally.
+
+Code: [`solution/submission.ipynb`](solution/submission.ipynb) · Predictions: [`solution/final_predictions.csv`](solution/final_predictions.csv)
+
+Built as a university exercise on the publicly released data, after the challenge had closed. All scores below are produced by running [the organizers' own `compute_score` function](#evaluation) over my predictions against the official 997-row test set.
+
+## The four labels are four different problems
+
+Everything in the design follows from this table:
+
+| | `hazard-category` | `product-category` | `hazard` | `product` |
+| --- | --- | --- | --- | --- |
+| Classes | 10 | 22 | 128 | **1,022** |
+| Training rows | 5,082 | 5,082 | 5,082 | 5,082 |
+| Largest class | 1,854 | 1,434 | 665 | 185 |
+| Smallest class | 3 | 5 | 3 | **1** |
+| **Classes with one example** | 0 | 0 | 0 | **458** |
+
+`hazard-category` is a 10-way problem with thousands of examples. `product` is a 1,022-way problem in which **458 classes appear exactly once** — and macro-F1 weights each of those equally against the class with 185. That gap is why the labels are not trained the same way.
+
+## Approach
+
+**One model per label.** Four independent RoBERTa-large fine-tunes rather than one shared multi-task head. With label spaces ranging from 10 to 1,022 classes, a shared head lets the easy labels dominate the gradient.
+
+**Input.** `title` and `text` concatenated, tokenized with `RobertaTokenizer` to 256 tokens.
+
+**Loss, chosen per label:**
+
+| Label | Loss | Why |
+| --- | --- | --- |
+| `hazard-category`, `product-category` | Cross-entropy | 10 and 22 well-populated classes |
+| `hazard`, `product` | **Focal Loss** | Long tails — focal loss down-weights the easy majority classes so the gradient keeps working on the rare ones |
+
+**Data augmentation** on the rare classes of `product-category` and `hazard`.
+
+**Training.** AdamW · linear schedule with 10% warmup · FP16 mixed precision (`autocast` + `GradScaler`) · 3 epochs for the category labels, 4–10 for the long-tailed ones.
+
+The training curves show why the extra epochs are there. `hazard-category` hits 94% validation accuracy after one epoch. `product` starts at **5.7%** and reaches 53% over ten.
+
+## Results
+
+Official metric — `(hazard macro-F1 + product macro-F1) / 2`, with products scored only on rows where the hazard was predicted correctly:
+
+| Sub-task | Hazard macro-F1 | Product macro-F1 | **Score** |
+| --- | --- | --- | --- |
+| **ST1** — categories | 0.7990 | 0.7801 | **0.7895** |
+| **ST2** — vectors | 0.6234 | 0.2827 | **0.4531** |
+
+Exact-match accuracy on the same test set:
+
+| Label | Classes | Accuracy |
+| --- | --- | --- |
+| `hazard-category` | 10 | **95.8%** |
+| `hazard` | 128 | 85.7% |
+| `product-category` | 22 | 83.3% |
+| `product` | 1,022 | 53.0% |
+
+**On `product`, 0.28 macro-F1 is close to the ceiling of the label distribution, not a modelling failure.** Nothing learns a class from a single example, and 458 classes have exactly one. The organizers evidently knew: their metric scores products *conditionally* on the hazard being right.
+
+For scale, the final ST1 leaderboard ran from **0.8223** at the top to 0.1426 at the bottom across 27 teams. **0.7895** sits fifth on that range — about 96% of the winning score.
+
+## How it was evaluated
+
+- **Trained on the official 5,082-row training set, unmodified.** No test rows were added.
+- **The 997-row test set served as the validation set** during training, so epoch counts were chosen while watching it. A cleaner run would hold out a validation split from the training data, tune on that, and touch the test set once.
+- 38 titles appear in both the official train and test files. That overlap is in the organizers' split, not introduced here.
+
+## Running it
+
+RoBERTa-large needs a GPU to fine-tune in reasonable time.
+
+```bash
+pip install torch transformers datasets pandas scikit-learn sentencepiece
+jupyter notebook solution/submission.ipynb
+```
+
+> The notebook's markdown commentary and docstrings are in **Greek**; code, labels and outputs are in English.
+
+## Stack
+
+Python · PyTorch · Hugging Face Transformers (RoBERTa-large) · Focal Loss · scikit-learn · pandas

@@ -1,3 +1,13 @@
+> ### 🔱 This is a fork.
+>
+> The task, the dataset, the baselines and everything below this box are the work of the **[SemEval 2025 Task 9 organizers](#task-organizers)**, preserved unchanged. I have added one thing: my own solution to the challenge, in [`solution/`](solution/).
+>
+> **→ [Jump to my solution](#my-solution)** — a RoBERTa-large system scoring **0.7895** on Sub-Task 1 under the organizers' own metric.
+>
+> I did **not** compete in the official challenge. This was built afterwards, as a university exercise, on the publicly released data.
+
+---
+
 # SemEval 2025 Task 9: The Food Hazard Detection Challenge
 
 The Food Hazard Detection task evaluates explainable classification systems for titles of food-incident reports collected from the web. These algorithms may help automated crawlers find and extract food issues from web sources like social media in the future. Due to the potential high economic impact, transparency is crucial for this task.
@@ -113,3 +123,111 @@ All texts come from official and publicly available sources, so no privacy issue
       <td style="width:195px"><img src="https://efraproject.eu/wp-content/uploads/2023/01/EN-Funded-by-the-EU-NEG-1024x215.png" alt="EU Flag" width="457"/></td>
    </tr>
 </table>
+
+---
+---
+
+# My Solution
+
+*Everything above this line is the organizers' work. Everything below is mine.*
+
+Four fine-tuned **RoBERTa-large** classifiers, one per label, with the class-imbalance problem attacked directly. Code: [`solution/submission.ipynb`](solution/submission.ipynb). Predictions: [`solution/final_predictions.csv`](solution/final_predictions.csv).
+
+> **Read this first.** I did **not** take part in the official challenge — no Codalab submission was ever made. I built this afterwards, as a university exercise, using the data the organizers released publicly once the task had closed. The scores below are computed by running [the organizers' own `compute_score` function](#evaluation) over my predictions against the official 997-row test set. They are honest numbers, but they are **not** a competition result, and the section on [what these scores are not](#what-these-scores-are-not) explains exactly why.
+
+## Results
+
+Scored with the organizers' metric, on the official test set:
+
+| Sub-task | Hazard macro-F1 | Product macro-F1 <br><sub>(scored only where the hazard was right)</sub> | **Official score** |
+| --- | --- | --- | --- |
+| **ST1** — categories | 0.7990 | 0.7801 | **0.7895** |
+| **ST2** — vectors | 0.6234 | 0.2827 | **0.4531** |
+
+Exact-match accuracy on the same test set:
+
+| Label | Classes | Accuracy |
+| --- | --- | --- |
+| `hazard-category` | 10 | **95.8%** |
+| `product-category` | 22 | 83.3% |
+| `hazard` | 128 | 85.7% |
+| `product` | **1,022** | 53.0% |
+
+### Where 0.7895 would have landed
+
+For context only — the final ST1 leaderboard had 27 ranked teams, topping out at 0.8223:
+
+| Rank | Team | ST1 score |
+| --- | --- | --- |
+| 1 | Anastasia | 0.8223 |
+| 4 | PATeam | 0.8017 |
+| — | *this solution* | *0.7895* |
+| 5 | HU | 0.7882 |
+| … | | |
+| 27 | *(last)* | 0.1426 |
+
+That is roughly **96% of the winning score**. Please read the caveats below before treating it as a placement — it isn't one.
+
+## The problem is not the model. It's the tail.
+
+The headline number to explain is `product`: **53% accuracy, 0.28 macro-F1.** That looks like a failure until you count the classes.
+
+| | `hazard-category` | `product-category` | `hazard` | `product` |
+| --- | --- | --- | --- | --- |
+| Classes | 10 | 22 | 128 | **1,022** |
+| Training rows | 5,082 | 5,082 | 5,082 | 5,082 |
+| Largest class | 1,854 | 1,434 | 665 | 185 |
+| Smallest class | 3 | 5 | 3 | **1** |
+| **Classes with a single example** | 0 | 0 | 0 | **458** |
+
+**Of the 1,022 product classes, 458 appear exactly once in the training data.** Nearly half the label space has a single example — and macro-F1 weights every one of those classes equally with the class that has 185.
+
+No model learns a class from one example. A macro-F1 of 0.28 on `product` is not a modelling failure; it is close to the arithmetic ceiling of the label distribution. The same effect is why the organizers' metric scores products *conditionally* on the hazard being right — they knew.
+
+This is also why the four labels are **not** trained the same way.
+
+## Approach
+
+**One model per label.** Four independent RoBERTa-large fine-tunes rather than a shared multi-task head. The labels have wildly different geometries — 10 classes versus 1,022 — and a shared head would let the easy labels dominate the gradient.
+
+**Input.** `title` and `text` concatenated, tokenized to 256 tokens.
+
+**Two different losses, chosen by the shape of the label:**
+
+| Label | Loss | Why |
+| --- | --- | --- |
+| `hazard-category`, `product-category` | Cross-entropy | 10 and 22 reasonably-populated classes. Nothing exotic required. |
+| `hazard`, `product` | **Focal Loss** | Long tails. Focal loss down-weights the easy, over-represented classes so the gradient keeps paying attention to the rare ones instead of collapsing onto the majority. |
+
+**Data augmentation** on the rare classes of `product-category` and `hazard`, to give the tail something to learn from.
+
+**Training.** AdamW, linear schedule with 10% warmup, FP16 mixed precision (`autocast` + `GradScaler`). 3 epochs for the category labels, 4–10 for the long-tailed ones — the tail needs longer to move.
+
+The training curves tell the story on their own. `hazard-category` reaches 94% validation accuracy after a single epoch. `product` starts at **5.7%**, and claws its way to 53% over ten.
+
+## What these scores are not
+
+Three things a reader should know before comparing this to the leaderboard, because I'd rather say them than have someone find them:
+
+1. **This was never submitted.** No Codalab entry, no official rank. The comparison above is retrospective.
+2. **I had the test labels; the real participants did not.** The labeled test set was released publicly during the Paper Phase, after the competition closed. Everyone on that leaderboard was predicting blind.
+3. **The test set was used as the validation set.** Per-epoch accuracy during training was measured on the same 997 rows the final score is computed on. Nothing was *trained* on it — the training set is the official 5,082 rows, unmodified — but epoch counts were chosen while watching it, which is a mild form of test-set peeking and will have flattered the result somewhat.
+
+A clean version of this experiment would hold out a validation split from the training data, tune on that, and touch the test set exactly once. That's the honest next step, and it is not done here.
+
+*(For completeness: 38 titles appear in both the official train and test files. That overlap is in the organizers' own split, not something introduced here.)*
+
+## Running it
+
+The notebook was written and run on a GPU instance; RoBERTa-large will not fine-tune comfortably on CPU.
+
+```bash
+pip install torch transformers datasets pandas scikit-learn sentencepiece
+jupyter notebook solution/submission.ipynb
+```
+
+> **Note:** the notebook's markdown commentary and docstrings are written in **Greek**. The code, labels and outputs are in English.
+
+## Stack
+
+Python · PyTorch · Hugging Face Transformers (RoBERTa-large) · Focal Loss · scikit-learn · pandas
